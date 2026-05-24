@@ -85,12 +85,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "You must join the channel and group to get access.",
             reply_markup=membership_keyboard(),
         )
-        return
+        return ConversationHandler.END
 
     await update.message.reply_text(
         "Select an option:",
         reply_markup=main_menu_keyboard(adm),
     )
+    return ConversationHandler.END
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -129,6 +130,7 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Select an option:",
         reply_markup=main_menu_keyboard(adm),
     )
+    return ConversationHandler.END
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -192,7 +194,6 @@ async def folder_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Send each log as its own message so content is never wrapped or altered
     await query.edit_message_text(
         f"📁 {folder['name']}",
         reply_markup=InlineKeyboardMarkup(
@@ -215,10 +216,10 @@ async def folder_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def add_folder_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not await is_admin(ctx.bot, query.from_user.id):
         await query.answer("Admins only.", show_alert=True)
         return ConversationHandler.END
+    await query.answer()
 
     await query.edit_message_text("Enter folder name:")
     return AWAIT_FOLDER_NAME
@@ -245,10 +246,10 @@ async def recv_folder_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def add_log_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not await is_admin(ctx.bot, query.from_user.id):
         await query.answer("Admins only.", show_alert=True)
         return ConversationHandler.END
+    await query.answer()
 
     folders = storage.get_folders()
     if not folders:
@@ -305,10 +306,10 @@ async def recv_log_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def delete_log_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not await is_admin(ctx.bot, query.from_user.id):
         await query.answer("Admins only.", show_alert=True)
         return
+    await query.answer()
 
     logs = storage.get_all_coupons()
     if not logs:
@@ -322,7 +323,6 @@ async def delete_log_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     buttons = [
         [InlineKeyboardButton(
-            # Show a preview of the log content (first 40 chars) + folder name
             f"🗑 {c['code'][:40]}{'…' if len(c['code']) > 40 else ''}  ({c['folder_name']})",
             callback_data=f"dellog_{c['id']}"
         )]
@@ -353,10 +353,10 @@ async def confirm_delete_log_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def delete_folder_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not await is_admin(ctx.bot, query.from_user.id):
         await query.answer("Admins only.", show_alert=True)
         return
+    await query.answer()
 
     folders = storage.get_folders()
     if not folders:
@@ -420,7 +420,12 @@ def main():
     folder_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_folder_cb, pattern="^add_folder$")],
         states={AWAIT_FOLDER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_folder_name)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CallbackQueryHandler(main_menu_cb, pattern="^main_menu$")
+        ],
+        allow_reentry=True
     )
 
     log_conv = ConversationHandler(
@@ -429,7 +434,12 @@ def main():
             AWAIT_LOG_FOLDER:  [CallbackQueryHandler(pick_folder_cb, pattern=r"^pick_folder_.+$")],
             AWAIT_LOG_CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_log_content)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CallbackQueryHandler(main_menu_cb, pattern="^main_menu$")
+        ],
+        allow_reentry=True
     )
 
     app.add_handler(CommandHandler("start", start))
