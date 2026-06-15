@@ -1,11 +1,13 @@
 import os
+import json
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Forbidden, BadRequest
 import storage
 
 logging.basicConfig(
@@ -15,7 +17,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ──────────────────────────────────────────────────────
-AWAIT_FOLDER_NAME, AWAIT_LOG_CONTENT, AWAIT_LOG_FOLDER = range(3)
+AWAIT_FOLDER_NAME, AWAIT_LOG_CONTENT, AWAIT_LOG_FOLDER, AWAIT_BROADCAST_MSG = range(4)
+
+# ── Users file path (Railway Volume is mounted at /data, same as storage) ────
+_STORAGE_DIR = os.environ.get("STORAGE_PATH", "/data")
+USERS_FILE   = os.environ.get("USERS_FILE", os.path.join(_STORAGE_DIR, "users.json"))
 
 # ── Config from env ──────────────────────────────────────────────────────────
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
@@ -67,6 +73,7 @@ def main_menu_keyboard(is_adm: bool) -> InlineKeyboardMarkup:
              InlineKeyboardButton("📁 New Folder",   callback_data="add_folder")],
             [InlineKeyboardButton("🗑 Delete Log",   callback_data="delete_log"),
              InlineKeyboardButton("🗂 Delete Folder", callback_data="delete_folder")],
+            [InlineKeyboardButton("📣 Broadcast",    callback_data="broadcast")],
         ]
     return InlineKeyboardMarkup(rows)
 
@@ -396,6 +403,131 @@ async def confirm_delete_folder_cb(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  BROADCAST
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_users() -> list[dict]:
+    """Load users from users.json.
+
+    Handles all common formats including your format:
+      {"folders": {...}, "users": {"12345": {"user_id": 12345, ...}, ...}}
+    Also handles users as a list of dicts or list of ints.
+    """
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Unwrap top-level wrapper dict -> grab 'users' value
+        if isinstance(data, dict):
+            data = data.get("users", [])
+
+        # data is now either a list or a dict-of-dicts (keyed by user_id string)
+        if isinstance(data, dict):
+            items = list(data.values())
+        else:
+            items = list(data)
+
+        users = []
+        for item in items:
+            if isinstance(item, int):
+                users.append({"id": item})
+            elif isinstance(item, dict):
+                # prefer explicit user_id field, fall back to id
+                uid = item.get("user_id") or item.get("id")
+                if uid:
+                    users.append({"id": int(uid)})
+        return users
+
+    except FileNotFoundError:
+        logger.warning("users.json not found at path: %s", USERS_FILE)
+        return []
+    except (json.JSONDecodeError, Exception) as e:
+        logger.error("Failed to load users.json: %s", e)
+        return []
+
+
+async def broadcast_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin presses the Broadcast button — ask for the message."""
+    query = update.callback_query
+    if not await is_admin(ctx.bot, query.from_user.id):
+        await query.answer("Admins only.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+
+    users = load_users()
+    if not users:
+        await query.edit_message_text(
+            "⚠️ No users found in users.json. Make sure the file exists and is formatted correctly.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]]
+            ),
+        )
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        f"📣 *Broadcast*\n\n"
+        f"Found *{len(users)}* users in users.json.\n\n"
+        f"Send the message you want to broadcast now.\n"
+        f"Supports text, photos, videos, and documents — just send it directly.\n\n"
+        f"Use /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return AWAIT_BROADCAST_MSG
+
+
+async def recv_broadcast_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receive the broadcast message and send it to all users."""
+    if not await is_admin(ctx.bot, update.effective_user.id):
+        return ConversationHandler.END
+
+    users = load_users()
+    total   = len(users)
+    success = 0
+    failed  = 0
+    blocked = 0
+
+    # Send a progress message first
+    progress_msg = await update.message.reply_text(
+        f"📤 Sending to {total} users… please wait."
+    )
+
+    for user in users:
+        uid = user["id"]
+        try:
+            # Forward the exact message the admin sent (preserves media, formatting)
+            await update.message.copy(chat_id=uid)
+            success += 1
+        except Forbidden:
+            # User blocked the bot
+            blocked += 1
+        except BadRequest as e:
+            logger.warning("BadRequest for user %s: %s", uid, e)
+            failed += 1
+        except TelegramError as e:
+            logger.warning("TelegramError for user %s: %s", uid, e)
+            failed += 1
+
+        # Small delay to respect Telegram rate limits (30 msg/sec max)
+        await asyncio.sleep(0.05)
+
+    adm = True  # we already checked above
+    summary = (
+        f"✅ Broadcast complete!\n\n"
+        f"👥 Total users: {total}\n"
+        f"✅ Delivered: {success}\n"
+        f"🚫 Blocked bot: {blocked}\n"
+        f"❌ Other errors: {failed}"
+    )
+
+    await progress_msg.edit_text(summary)
+    await update.message.reply_text(
+        "Back to menu:",
+        reply_markup=main_menu_keyboard(adm),
+    )
+    return ConversationHandler.END
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  CANCEL
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -442,9 +574,29 @@ def main():
         allow_reentry=True
     )
 
+    broadcast_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(broadcast_cb, pattern="^broadcast$")],
+        states={
+            AWAIT_BROADCAST_MSG: [
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL)
+                    & ~filters.COMMAND,
+                    recv_broadcast_msg,
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CallbackQueryHandler(main_menu_cb, pattern="^main_menu$"),
+        ],
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(folder_conv)
     app.add_handler(log_conv)
+    app.add_handler(broadcast_conv)
     app.add_handler(CallbackQueryHandler(check_membership_cb,      pattern="^check_membership$"))
     app.add_handler(CallbackQueryHandler(main_menu_cb,             pattern="^main_menu$"))
     app.add_handler(CallbackQueryHandler(browse_cb,                pattern="^browse$"))
