@@ -1,1 +1,1 @@
-worker: python bot.py
+worker: python upload_users.py
