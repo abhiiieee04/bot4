@@ -2,8 +2,8 @@
 upload_users.py — Upload users.json to the Railway volume via Telegram.
 
 HOW TO USE:
-  1. Stop your main bot (or it will steal the messages)
-  2. Deploy this as a separate Railway service with the same env vars
+  1. Stop your main bot service on Railway
+  2. Deploy this as a separate Railway service with the same env vars + ADMIN_ID
   3. Send /uploadusers to your bot and attach users.json
   4. Once done, stop this service and restart your main bot
 """
@@ -11,12 +11,14 @@ HOW TO USE:
 import os
 import json
 import logging
+import urllib.request
 from pathlib import Path
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,11 +28,21 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
-ADMIN_ID    = int(os.environ["ADMIN_ID"])          # your Telegram user ID (integer)
+ADMIN_ID    = int(os.environ["ADMIN_ID"])
 STORAGE_DIR = Path(os.environ.get("STORAGE_PATH", "/data"))
 USERS_FILE  = Path(os.environ.get("USERS_FILE", str(STORAGE_DIR / "users.json")))
 
 AWAIT_FILE = 0
+
+
+# ── Download via raw urllib (bypasses python-telegram-bot's HTTP client) ──────
+def download_file(file_path: str) -> bytes:
+    """Download a file from Telegram using urllib with a long timeout."""
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    logger.info("Downloading from: %s", url)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.read()
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -54,27 +66,43 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     doc = update.message.document
     if doc is None:
-        await update.message.reply_text("⚠️ Please send the file as a document (not as a photo/media).")
+        await update.message.reply_text(
+            "⚠️ Please send the file as a document (not as a photo/media)."
+        )
         return AWAIT_FILE
 
-    # Accept any filename as long as the content is valid JSON
-    await update.message.reply_text("⏳ Downloading and validating...")
+    await update.message.reply_text("⏳ Downloading file...")
 
+    # Step 1: get the file path from Telegram
     try:
         tg_file = await ctx.bot.get_file(doc.file_id)
-        raw = await tg_file.download_as_bytearray()
+        file_path = tg_file.file_path  # e.g. "documents/file_123.json"
     except Exception as e:
-        await update.message.reply_text(f"❌ Download failed: {e}")
+        await update.message.reply_text(f"❌ Could not get file info: {e}")
         return AWAIT_FILE
 
-    # Validate JSON
+    # Step 2: download with raw urllib (avoids PTB timeout issues)
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, download_file, file_path)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Download failed: {e}\n\n"
+            f"Try sending a smaller test file or check Railway's outbound network."
+        )
+        return AWAIT_FILE
+
+    await update.message.reply_text("✅ Downloaded! Validating...")
+
+    # Step 3: validate JSON
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         await update.message.reply_text(f"❌ Invalid JSON: {e}")
         return AWAIT_FILE
 
-    # Count users (handles all formats)
+    # Count users
     if isinstance(data, dict):
         users = data.get("users", data)
     else:
@@ -82,17 +110,19 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_count = len(users)
 
     if user_count == 0:
-        await update.message.reply_text("⚠️ No users found in the file. Double-check the format.")
+        await update.message.reply_text(
+            "⚠️ No users found in the file. Double-check the format."
+        )
         return AWAIT_FILE
 
-    # Save atomically to the Railway volume
+    # Step 4: save atomically to the Railway volume
     try:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = USERS_FILE.with_suffix(".tmp")
         tmp.write_bytes(raw)
         tmp.replace(USERS_FILE)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to save file: {e}")
+        await update.message.reply_text(f"❌ Failed to save to disk: {e}")
         return AWAIT_FILE
 
     logger.info("users.json saved to %s (%d users)", USERS_FILE, user_count)
@@ -118,7 +148,6 @@ async def fallback_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    from telegram.request import HTTPXRequest
     request = HTTPXRequest(
         connect_timeout=30,
         read_timeout=60,
