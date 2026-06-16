@@ -1,11 +1,11 @@
 """
-upload_users.py — Standalone bot for uploading users.json to the Railway volume.
+upload_users.py — Upload users.json to the Railway volume via Telegram.
 
-Run this SEPARATELY from your main bot (just temporarily).
-Send /uploadusers in Telegram, then attach your users.json file.
-The bot saves it to /data/users.json on the Railway volume.
-
-Uses the same env vars as your main bot.
+HOW TO USE:
+  1. Stop your main bot (or it will steal the messages)
+  2. Deploy this as a separate Railway service with the same env vars
+  3. Send /uploadusers to your bot and attach users.json
+  4. Once done, stop this service and restart your main bot
 """
 
 import os
@@ -17,7 +17,6 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
-from telegram.error import TelegramError
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,36 +25,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-CHANNEL_ID   = os.environ["CHANNEL_ID"]
-GROUP_ID     = os.environ["GROUP_ID"]
-STORAGE_DIR  = Path(os.environ.get("STORAGE_PATH", "/data"))
-USERS_FILE   = Path(os.environ.get("USERS_FILE", str(STORAGE_DIR / "users.json")))
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+ADMIN_ID    = int(os.environ["ADMIN_ID"])          # your Telegram user ID (integer)
+STORAGE_DIR = Path(os.environ.get("STORAGE_PATH", "/data"))
+USERS_FILE  = Path(os.environ.get("USERS_FILE", str(STORAGE_DIR / "users.json")))
 
-# ── Conversation state ────────────────────────────────────────────────────────
 AWAIT_FILE = 0
-
-
-# ── Admin check (same logic as main bot) ─────────────────────────────────────
-async def is_admin(bot, user_id: int) -> bool:
-    for chat_id in [CHANNEL_ID, GROUP_ID]:
-        try:
-            member = await bot.get_chat_member(chat_id, user_id)
-            if member.status in ("administrator", "creator"):
-                return True
-        except TelegramError:
-            pass
-    return False
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(ctx.bot, update.effective_user.id):
+    if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admins only.")
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "📎 Send your *users.json* file now as a document attachment.\n\n"
+        "📎 Send your *users.json* file now as a document.\n\n"
         "Use /cancel to abort.",
         parse_mode="Markdown",
     )
@@ -63,49 +48,60 @@ async def start_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(ctx.bot, update.effective_user.id):
+    if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admins only.")
         return ConversationHandler.END
 
     doc = update.message.document
-    if not doc.file_name.endswith(".json"):
-        await update.message.reply_text(
-            "⚠️ That doesn't look like a .json file. Please send your users.json."
-        )
+    if doc is None:
+        await update.message.reply_text("⚠️ Please send the file as a document (not as a photo/media).")
         return AWAIT_FILE
 
-    # Download the file
-    tg_file = await ctx.bot.get_file(doc.file_id)
-    raw = await tg_file.download_as_bytearray()
+    # Accept any filename as long as the content is valid JSON
+    await update.message.reply_text("⏳ Downloading and validating...")
 
-    # Validate it's proper JSON with a users key
+    try:
+        tg_file = await ctx.bot.get_file(doc.file_id)
+        raw = await tg_file.download_as_bytearray()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Download failed: {e}")
+        return AWAIT_FILE
+
+    # Validate JSON
     try:
         data = json.loads(raw)
-        if isinstance(data, dict):
-            users = data.get("users", {})
-        elif isinstance(data, list):
-            users = data
-        else:
-            raise ValueError("Unexpected JSON structure")
-        user_count = len(users)
-    except (json.JSONDecodeError, ValueError) as e:
-        await update.message.reply_text(
-            f"❌ Invalid JSON file: {e}\n\nPlease check your file and try again."
-        )
+    except json.JSONDecodeError as e:
+        await update.message.reply_text(f"❌ Invalid JSON: {e}")
         return AWAIT_FILE
 
-    # Save to the Railway volume
-    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = USERS_FILE.with_suffix(".tmp")
-    tmp.write_bytes(raw)
-    tmp.replace(USERS_FILE)  # atomic rename, same as storage.py
+    # Count users (handles all formats)
+    if isinstance(data, dict):
+        users = data.get("users", data)
+    else:
+        users = data
+    user_count = len(users)
+
+    if user_count == 0:
+        await update.message.reply_text("⚠️ No users found in the file. Double-check the format.")
+        return AWAIT_FILE
+
+    # Save atomically to the Railway volume
+    try:
+        STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = USERS_FILE.with_suffix(".tmp")
+        tmp.write_bytes(raw)
+        tmp.replace(USERS_FILE)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to save file: {e}")
+        return AWAIT_FILE
 
     logger.info("users.json saved to %s (%d users)", USERS_FILE, user_count)
     await update.message.reply_text(
-        f"✅ *users.json saved successfully!*\n\n"
-        f"📍 Path: `{USERS_FILE}`\n"
-        f"👥 Users found: *{user_count}*\n\n"
-        f"You can now restart your main bot and use 📣 Broadcast.",
+        f"✅ *Saved successfully!*\n\n"
+        f"📍 `{USERS_FILE}`\n"
+        f"👥 Users: *{user_count}*\n\n"
+        f"You can now stop this service and restart your main bot.\n"
+        f"Use 📣 Broadcast from the admin menu.",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -116,32 +112,31 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Use /uploadusers to upload your users.json file."
-    )
+async def fallback_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send /uploadusers to begin.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    upload_conv = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[CommandHandler("uploadusers", start_upload)],
         states={
             AWAIT_FILE: [
-                MessageHandler(filters.Document.ALL, receive_file)
+                MessageHandler(filters.ALL & ~filters.COMMAND, receive_file)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
 
-    app.add_handler(upload_conv)
-    app.add_handler(MessageHandler(filters.ALL, unknown))
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("start", fallback_msg))
+    app.add_handler(MessageHandler(filters.ALL, fallback_msg))
 
-    logger.info("Upload bot running — send /uploadusers in Telegram")
-    app.run_polling()
+    logger.info("Upload bot polling — send /uploadusers in Telegram")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
