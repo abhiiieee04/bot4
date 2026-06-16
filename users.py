@@ -1,17 +1,18 @@
 """
-upload_users.py — Upload users.json to the Railway volume via Telegram.
+upload_users.py — Save users.json to Railway volume by pasting JSON directly.
+
+No file download needed — just paste the JSON text in chat.
 
 HOW TO USE:
-  1. Stop your main bot service on Railway
-  2. Deploy this as a separate Railway service with the same env vars + ADMIN_ID
-  3. Send /uploadusers to your bot and attach users.json
-  4. Once done, stop this service and restart your main bot
+  1. Open your users.json file on your computer
+  2. Copy ALL the text inside it
+  3. Send /uploadusers to the bot
+  4. Paste the copied JSON text and send it
 """
 
 import os
 import json
 import logging
-import urllib.request
 from pathlib import Path
 from telegram import Update
 from telegram.ext import (
@@ -32,17 +33,7 @@ ADMIN_ID    = int(os.environ["ADMIN_ID"])
 STORAGE_DIR = Path(os.environ.get("STORAGE_PATH", "/data"))
 USERS_FILE  = Path(os.environ.get("USERS_FILE", str(STORAGE_DIR / "users.json")))
 
-AWAIT_FILE = 0
-
-
-# ── Download via raw urllib (bypasses python-telegram-bot's HTTP client) ──────
-def download_file(file_path: str) -> bytes:
-    """Download a file from Telegram using urllib with a long timeout."""
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    logger.info("Downloading from: %s", url)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return resp.read()
+AWAIT_JSON = 0
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -52,55 +43,36 @@ async def start_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "📎 Send your *users.json* file now as a document.\n\n"
+        "📋 *Paste your users.json content*\n\n"
+        "1. Open users.json on your computer\n"
+        "2. Select all text (Ctrl+A / Cmd+A)\n"
+        "3. Copy it (Ctrl+C / Cmd+C)\n"
+        "4. Paste it here and send\n\n"
         "Use /cancel to abort.",
         parse_mode="Markdown",
     )
-    return AWAIT_FILE
+    return AWAIT_JSON
 
 
-async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def receive_json(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admins only.")
         return ConversationHandler.END
 
-    doc = update.message.document
-    if doc is None:
-        await update.message.reply_text(
-            "⚠️ Please send the file as a document (not as a photo/media)."
-        )
-        return AWAIT_FILE
+    text = update.message.text or ""
+    if not text.strip():
+        await update.message.reply_text("⚠️ Got an empty message. Please paste your JSON text.")
+        return AWAIT_JSON
 
-    await update.message.reply_text("⏳ Downloading file...")
-
-    # Step 1: get the file path from Telegram
+    # Validate JSON
     try:
-        tg_file = await ctx.bot.get_file(doc.file_id)
-        file_path = tg_file.file_path  # e.g. "documents/file_123.json"
-    except Exception as e:
-        await update.message.reply_text(f"❌ Could not get file info: {e}")
-        return AWAIT_FILE
-
-    # Step 2: download with raw urllib (avoids PTB timeout issues)
-    try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, download_file, file_path)
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Download failed: {e}\n\n"
-            f"Try sending a smaller test file or check Railway's outbound network."
-        )
-        return AWAIT_FILE
-
-    await update.message.reply_text("✅ Downloaded! Validating...")
-
-    # Step 3: validate JSON
-    try:
-        data = json.loads(raw)
+        data = json.loads(text.strip())
     except json.JSONDecodeError as e:
-        await update.message.reply_text(f"❌ Invalid JSON: {e}")
-        return AWAIT_FILE
+        await update.message.reply_text(
+            f"❌ Invalid JSON: {e}\n\n"
+            "Make sure you copied the entire file content."
+        )
+        return AWAIT_JSON
 
     # Count users
     if isinstance(data, dict):
@@ -111,26 +83,27 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if user_count == 0:
         await update.message.reply_text(
-            "⚠️ No users found in the file. Double-check the format."
+            "⚠️ No users found in the JSON. Double-check the content."
         )
-        return AWAIT_FILE
+        return AWAIT_JSON
 
-    # Step 4: save atomically to the Railway volume
+    # Save atomically to Railway volume
     try:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         tmp = USERS_FILE.with_suffix(".tmp")
         tmp.write_bytes(raw)
         tmp.replace(USERS_FILE)
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to save to disk: {e}")
-        return AWAIT_FILE
+        return ConversationHandler.END
 
     logger.info("users.json saved to %s (%d users)", USERS_FILE, user_count)
     await update.message.reply_text(
         f"✅ *Saved successfully!*\n\n"
         f"📍 `{USERS_FILE}`\n"
         f"👥 Users: *{user_count}*\n\n"
-        f"You can now stop this service and restart your main bot.\n"
+        f"Stop this service and restart your main bot.\n"
         f"Use 📣 Broadcast from the admin menu.",
         parse_mode="Markdown",
     )
@@ -148,19 +121,14 @@ async def fallback_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=60,
-        write_timeout=60,
-        media_write_timeout=120,
-    )
+    request = HTTPXRequest(connect_timeout=30, read_timeout=60, write_timeout=60)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("uploadusers", start_upload)],
         states={
-            AWAIT_FILE: [
-                MessageHandler(filters.ALL & ~filters.COMMAND, receive_file)
+            AWAIT_JSON: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_json)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
