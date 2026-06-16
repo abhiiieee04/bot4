@@ -118,7 +118,14 @@ async def fallback_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=60,
+        write_timeout=60,
+        media_write_timeout=120,
+    )
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("uploadusers", start_upload)],
